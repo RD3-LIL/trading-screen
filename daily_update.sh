@@ -13,10 +13,14 @@ python3 fetch.py || {
   echo "fetch failed, stopping (data/prices.json keeps last good values, labeled stale)"
   exit 1
 }
+python3 signals.py || {
+  echo "signals failed, stopping (data/signals.json keeps last good values)"
+  exit 1
+}
 python3 build_page.py || exit 1
 echo "rebuilt index.html locally, push is manual"
 # Manual push, do not automate here:
-# /opt/hatch/bin/github push-files --owner RD3-LIL --repo Trading-Screen --branch main \
+# /opt/hatch/bin/github push-files --owner RD3-LIL --repo trading-screen --branch main \
 #   --message "Daily update: trading screen $(date +%Y-%m-%d)" \
 #   --source-dir /home/hatch/workspace/trading-screen \
 #   --paths-file /home/hatch/workspace/trading-screen-push-manifest.bin

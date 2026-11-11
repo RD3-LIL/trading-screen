@@ -3,6 +3,8 @@
 Built Nov 11, 2026 in this folder, on disk only, no push yet. Ron created public repo RD3-LIL/trading-screen on github.com (created 17:39 UTC Nov 11, default branch main), so the next step is push plus Pages enable, not repo creation.
 Verified run Nov 11, 11:39 AM Chicago: Yahoo 30 of 30 tickers ok, ECB ok (EUR/USD 1.1127), FRED all 7 series unavailable (timeout), CFTC COT unavailable (HTTP 403 Forbidden). Spot values in that run: EUR/USD 1.1095, Gold 4,010.60, WTI 86.99, Brent 93.05, DXY 102.91, S and P 500 7,634.17, Nasdaq 25,618.08, VIX 17.72, US 10Y 5.00%.
 
+Retry Nov 11, 12:04 PM Chicago: CFTC now works, both files HTTP 200, 14 COT rows parsed (6 FX from FinFutWk.txt, 8 commodities from deacom.txt, report date 2026-11-03). Root causes of the v1 failure: the 403 was transient, and the parser used line.startswith on lines that start with a quote, so nothing ever matched. US Treasury Daily Par Yield Curve Rates TextView page also works (HTTP 200, parses cleanly) and supplies the 2Y yield Yahoo lacks: 2Y 4.73%, 10Y 4.98% on 11/10/2026, 2Y/10Y slope +0.25. FRED still dead (curl HTTP 000 on all three variants; API without a key returns HTTP 400, a free 32-character key is required). Stooq still dead (curl HTTP 000, both endpoints). Live site https://rd3-lil.github.io/trading-screen/ is now HTTP 200 (was 404 at 11:53). Rebuilt index.html is 22,462 bytes, generated 12:04 PM Chicago. NOT pushed.
+
 ## Goal
 Institutional-level morning screen for FX and commodities, built from free data only. Not for trading. Same process as College Ratings: Python fetcher, static site, GitHub Pages, daily refresh.
 

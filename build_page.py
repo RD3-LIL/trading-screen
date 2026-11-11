@@ -89,6 +89,44 @@ def main():
     def get(sym):
         return tickers.get(sym, {})
 
+    # Composite signals v1, from data/signals.json (locked rules in signals.py).
+    sig_path = ROOT / "data" / "signals.json"
+    sig_rows = []
+    sig_note = "Composite signals unavailable in this run (data/signals.json not found)."
+    sig_counts = {}
+    if sig_path.exists():
+        sig = json.loads(sig_path.read_text())
+        sig_counts = sig.get("counts_by_label", {})
+        sig_note = (
+            f"Signals as of {html.escape(str(sig.get('generated_at_chicago', '')))}. "
+            "Score 0 to 100: Trend 40, Momentum 30, Mean reversion 15, Volatility and context 15. "
+            "Strong Bullish 75 or higher, Bullish 60 to 74, Neutral 40 to 59, Bearish 25 to 39, Strong Bearish below 25. "
+            "A signal is a systematic flag to look closer, not a buy or sell call and not investment advice."
+        )
+        for sym, s in sorted(sig.get("tickers", {}).items(), key=lambda kv: -kv[1].get("score", 0)):
+            reasons = "; ".join(s.get("reasons", [])[:3])
+            sig_rows.append([
+                f"<strong>{html.escape(s.get('name', sym))}</strong><br><span class='sym'>{html.escape(sym)}</span>",
+                num(s.get("score"), 0),
+                html.escape(s.get("label", "")),
+                num(s.get("trend"), 0),
+                num(s.get("momentum"), 0),
+                num(s.get("mean_reversion"), 0),
+                num(s.get("volatility_context"), 0),
+                html.escape(reasons),
+            ])
+    signals_table = table(
+        ["Instrument", "Score", "Label", "Trend /40", "Momentum /30", "Mean rev /15", "Vol /15", "Top reasons"],
+        sig_rows,
+    ) if sig_rows else "<p>Composite signals unavailable in this run.</p>"
+    backtest_note = (
+        "Backtest, rules locked before testing, 5y daily history, 31,561 observations: "
+        "20-day forward return, Bullish labels averaged +0.35% versus Neutral +0.38%, "
+        "Bearish labels averaged +1.65%, so Bearish labels rose on average instead of falling. "
+        "Verdict: no signal. Bullish did not beat Neutral, and Bearish behaved like a contrarian bounce flag in this window. "
+        "Full numbers in backtest_signals.md. No thresholds were tuned after seeing these results."
+    )
+
     # Cross asset snapshot
     snap = []
     for sym in ["DX-Y.NYB", "^GSPC", "^IXIC", "^VIX", "^TNX", "^FVX", "^IRX"]:
@@ -124,6 +162,23 @@ def main():
             fred_rows.append([html.escape(label), "unavailable", "n/a", f"not fetched: {html.escape(str(f.get('error', 'timeout') or ''))}"])
     fred_table = table(["Series", "Value", "Date", "Status"], fred_rows)
 
+    # US Treasury par yields, the only free source found for the 2Y.
+    tsy = payload.get("treasury", {})
+    slope_2_10 = None
+    if tsy.get("status") == "ok":
+        y = tsy.get("yields", {})
+        tsy_rows = []
+        for tenor in ["1 Yr", "2 Yr", "3 Yr", "5 Yr", "7 Yr", "10 Yr", "20 Yr", "30 Yr"]:
+            if tenor in y:
+                tsy_rows.append([html.escape(tenor), num(y[tenor], 2)])
+        if "2 Yr" in y and "10 Yr" in y:
+            slope_2_10 = y["10 Yr"] - y["2 Yr"]
+        tsy_html = table(["Tenor", "Yield %"], tsy_rows)
+        tsy_note = f"US Treasury Daily Par Yield Curve Rates, {html.escape(str(tsy.get('date', '')))}. 2Y/10Y slope: {num(slope_2_10, 2)} points."
+    else:
+        tsy_html = "<p class='warn'>Treasury par yields unavailable in this run. " + html.escape(str(tsy.get("error", ""))) + "</p>"
+        tsy_note = "Treasury par yields unavailable in this run, so the 2Y/10Y spread is not shown."
+
     # Positioning
     cot = payload.get("cot", {})
     if cot.get("status") == "ok" and cot.get("rows"):
@@ -136,8 +191,9 @@ def main():
                 num(r.get("noncommercial_short"), 0),
                 num(net, 0),
                 num(r.get("open_interest"), 0),
+                html.escape(r.get("source", "")),
             ])
-        cot_html = table(["Contract", "Non-commercial long", "Non-commercial short", "Net long minus short", "Open interest"], cot_rows)
+        cot_html = table(["Contract", "Non-commercial long", "Non-commercial short", "Net long minus short", "Open interest", "Source"], cot_rows)
         cot_note = html.escape(cot.get("note", ""))
     else:
         cot_html = "<p class='warn'>Positioning is unavailable in this run. " + html.escape(cot.get("note", "CFTC COT did not load. No numbers have been invented.")) + "</p>"
@@ -232,6 +288,12 @@ a {{ color: #7fd1ff; }}
 <div class="cards">{snapshot}</div>
 <p class="note">{ecb_line}</p>
 
+<h2>Signals, composite score (v1)</h2>
+<p class="note">{sig_note}</p>
+{signals_table}
+<p class="note"><strong>Counts:</strong> Strong Bullish {sig_counts.get('Strong Bullish', 0)}, Bullish {sig_counts.get('Bullish', 0)}, Neutral {sig_counts.get('Neutral', 0)}, Bearish {sig_counts.get('Bearish', 0)}, Strong Bearish {sig_counts.get('Strong Bearish', 0)}.</p>
+<p class="note">{backtest_note}</p>
+
 <h2>FX board, G10</h2>
 {fx_table}
 <p class="note">Carry: policy rate differentials are not in the free Yahoo feed, so no carry column is shown. Trend is last price versus the 50 day and 200 day averages. 52W pos is where the last price sits in its 52 week range, 0 is the low, 100 is the high.</p>
@@ -246,9 +308,11 @@ a {{ color: #7fd1ff; }}
 
 <h2>Macro and rates</h2>
 {rates_table}
-<p class="note">Yahoo yields are the primary rates source in this build: 13 week bill, 5Y, 10Y, 30Y. 10Y minus 5Y slope: {num(slope_10_5, 2)} points. 30Y minus 10Y slope: {num(slope_30_10, 2)} points. A 2Y yield is not in the free Yahoo feed, so the 2Y/10Y spread is not shown. FRED was attempted with a 12 second timeout and is shown below, with failures labeled honestly.</p>
+<p class="note">Yahoo yields are the primary rates source in this build: 13 week bill, 5Y, 10Y, 30Y. 10Y minus 5Y slope: {num(slope_10_5, 2)} points. 30Y minus 10Y slope: {num(slope_30_10, 2)} points. {tsy_note} FRED was attempted with a 12 second timeout and is shown below, with failures labeled honestly.</p>
 <h3>FRED macro series (attempted, may be unavailable)</h3>
 {fred_table}
+<h3>US Treasury par yields (official, fills the 2Y gap)</h3>
+{tsy_html}
 <h3>Driver notes (paired moves, not causality)</h3>
 <p class="note">{drivers}</p>
 
@@ -256,7 +320,7 @@ a {{ color: #7fd1ff; }}
 {cot_html}
 <p class="note">{html.escape(cot_note)}</p>
 
-<h2>Signals</h2>
+<h2>Signals, movers and extremes</h2>
 <h3>Biggest 1 day movers</h3>
 {movers_table}
 <h3>RSI extremes</h3>
@@ -265,10 +329,10 @@ a {{ color: #7fd1ff; }}
 {break_table}
 </main>
 <footer>
-<p><strong>Sources:</strong> Yahoo Finance chart API (no key, 1 year daily), ECB daily euro reference rates (no key), FRED fredgraph.csv (attempted, 12s timeout), CFTC Commitments of Traders weekly text file.</p>
+<p><strong>Sources:</strong> Yahoo Finance chart API (no key, 1 year daily), ECB daily euro reference rates (no key), US Treasury Daily Par Yield Curve Rates (no key), FRED fredgraph.csv (attempted, 12s timeout), CFTC Commitments of Traders weekly text files (FinFutWk.txt for FX, deacom.txt legacy combined for commodities).</p>
 <p><strong>Honest limits:</strong> Yahoo is unofficial and indicative, not execution grade. No tick data, no order book, no options volatility surface, no OTC forwards or swaps, no credit spreads at institutional depth. COT is weekly and lagged (Tuesday positions, released Friday). FRED is daily and lagged. Futures are front month only. This screen is a learning exercise, not a trading signal and not investment advice.</p>
 <p><strong>How to read it:</strong> start with the snapshot, then check FX and commodities for trend (above or below the 200 day average) and momentum (RSI), then check rates and positioning for context. A signal on this page alone is not a trade.</p>
-<p>Built from free data only. Refresh: python3 fetch.py, then python3 build_page.py.</p>
+<p>Built from free data only. Refresh: python3 fetch.py, then python3 signals.py, then python3 build_page.py. Backtest: python3 backtest.py (5y history, rules locked first).</p>
 </footer>
 <script>
 document.querySelectorAll('table.sortable').forEach(function(t){{

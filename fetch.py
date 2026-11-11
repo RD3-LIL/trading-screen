@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
 OUT = DATA_DIR / "prices.json"
-UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+UA = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
 # label, group, Yahoo symbol
 TICKERS = [
@@ -65,7 +65,35 @@ TICKERS = [
 ]
 
 FRED_SERIES = ["DGS2", "DGS10", "DGS30", "T10YIE", "CPIAUCSL", "FEDFUNDS", "DFII10"]
-COT_URL = "https://www.cftc.gov/dea/newcot/FinFutWk.txt"
+# Legacy COT, futures-only columns (0-indexed): 7 open interest, 8 non-commercial
+# long, 9 non-commercial short. Verified Nov 11 against the downloaded files:
+# total long equals NC long plus spreading plus commercial long, and total
+# long plus nonreportable long equals open interest (within a few contracts
+# of CFTC rounding). Both files use the same legacy layout, so one parser
+# serves both. FinFutWk is financial futures only (FX here). deacom is the
+# legacy combined file, which holds the commodities. The plain NYMEX WTI
+# futures line is not in deacom, so WTI uses the ICE Europe light sweet
+# line and NatGas uses Henry Hub, both labeled as such on the page.
+COT_FILES = [
+    ("FinFutWk.txt", "https://www.cftc.gov/dea/newcot/FinFutWk.txt", {
+        "EURO FX - CHICAGO MERCANTILE EXCHANGE": "EUR",
+        "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE": "GBP",
+        "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE": "JPY",
+        "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE": "CAD",
+        "SWISS FRANC - CHICAGO MERCANTILE EXCHANGE": "CHF",
+        "AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE": "AUD",
+    }),
+    ("deacom.txt", "https://www.cftc.gov/dea/newcot/deacom.txt", {
+        "GOLD - COMMODITY EXCHANGE INC.": "Gold",
+        "SILVER - COMMODITY EXCHANGE INC.": "Silver",
+        "COPPER- #1 - COMMODITY EXCHANGE INC.": "Copper",
+        "CRUDE OIL, LIGHT SWEET-WTI - ICE FUTURES EUROPE": "WTI (ICE Europe)",
+        "HENRY HUB - NEW YORK MERCANTILE EXCHANGE": "NatGas (Henry Hub)",
+        "CORN - CHICAGO BOARD OF TRADE": "Corn",
+        "WHEAT-SRW - CHICAGO BOARD OF TRADE": "Wheat (SRW)",
+        "SOYBEANS - CHICAGO BOARD OF TRADE": "Soybeans",
+    }),
+]
 
 
 def fetch_url(url, timeout=15):
@@ -193,44 +221,119 @@ def fetch_fred(series):
         return {"series": series, "status": "unavailable", "error": "unparsable value"}
 
 
-def fetch_cot():
-    # CFTC legacy futures-only COT, weekly text file. Parse is best effort:
-    # look for a few well known contracts by name and report net non-commercial.
+def _parse_cot_line(parts, strict=True):
+    # parts is one csv-parsed COT row. Returns a dict or None.
+    # Fields 7/8/9 are open interest, non-commercial long, non-commercial
+    # short in both legacy files, verified Nov 11: values are plausible and
+    # in the same direction as the combined file. deacom also satisfies the
+    # total identity (total long at 13 equals NC long plus spreading plus
+    # commercial long, total long plus nonreportable long equals OI, within
+    # a few contracts of CFTC rounding), so it gets the strict check.
+    # FinFutWk does NOT satisfy that identity: its post-commercial columns
+    # 13-19 are extra fields (totals sit at 20-23 and do reconcile with OI,
+    # but the long categories do not sum to them), so it gets bounds only.
+    # Do not tighten this without first identifying columns 13-19.
     try:
-        raw = fetch_url(COT_URL, timeout=15)
-    except Exception as e:
-        return {"status": "unavailable", "error": str(e)[:160], "note": "CFTC COT file did not load. Positioning is shown as unavailable, no numbers invented.", "rows": []}
+        oi = int(float(parts[7]))
+        longs = int(float(parts[8]))
+        shorts = int(float(parts[9]))
+        spread = int(float(parts[10]))
+        comm_long = int(float(parts[11]))
+        total_long = int(float(parts[13]))
+        nonrep_long = int(float(parts[15]))
+    except (ValueError, IndexError):
+        return None
+    if oi <= 0 or longs < 0 or shorts < 0 or longs > oi or shorts > oi:
+        return None
+    if strict:
+        if abs(total_long - (longs + spread + comm_long)) > 5:
+            return None
+        if abs((total_long + nonrep_long) - oi) > 5:
+            return None
+    return {"open_interest": oi, "noncommercial_long": longs,
+            "noncommercial_short": shorts,
+            "net_noncommercial": longs - shorts}
+
+
+def fetch_cot():
+    # Earlier failure was two bugs, both fixed Nov 11 on retry: the CFTC
+    # 403 was transient (same URL returns 200 now, even with the old UA),
+    # and the parser used line.startswith(name) on lines that start with a
+    # quote, so no contract ever matched. Now csv-parsed with exact names.
     rows = []
-    targets = {
-        "EURO FX": "EUR",
-        "JAPANESE YEN": "JPY",
-        "BRITISH POUND": "GBP",
-        "GOLD": "Gold",
-        "SILVER": "Silver",
-        "CRUDE OIL, LIGHT SWEET": "WTI",
-        "COPPER": "Copper",
-        "NATURAL GAS": "NatGas",
-        "CORN": "Corn",
-        "WHEAT": "Wheat",
-        "SOYBEANS": "Soybeans",
-    }
-    for line in raw.splitlines():
-        for key, label in targets.items():
-            if line.startswith(key):
-                parts = [p.strip() for p in line.split(",")]
-                # Legacy format: open interest is field 7, non-commercial
-                # longs field 8, shorts field 9 in the comma file.
-                try:
-                    oi = int(float(parts[7])) if len(parts) > 7 else None
-                    longs = int(float(parts[8])) if len(parts) > 8 else None
-                    shorts = int(float(parts[9])) if len(parts) > 9 else None
-                    net = (longs - shorts) if longs is not None and shorts is not None else None
-                    rows.append({"contract": label, "open_interest": oi, "noncommercial_long": longs, "noncommercial_short": shorts, "net_noncommercial": net})
-                except (ValueError, IndexError):
-                    pass
+    dates = []
+    errors = []
+    import csv as _csv
+    import io as _io
+    for fname, url, targets in COT_FILES:
+        try:
+            raw = fetch_url(url, timeout=30)
+        except Exception as e:
+            errors.append(f"{fname}: {e}"[:160])
+            continue
+        strict = (fname == "deacom.txt")
+        for line in raw.splitlines():
+            row = next(_csv.reader(_io.StringIO(line)), None)
+            if not row or len(row) < 17:
+                continue
+            label = targets.get(row[0])
+            if not label:
+                continue
+            parsed = _parse_cot_line(row, strict=strict)
+            if not parsed:
+                continue
+            parsed["contract"] = label
+            parsed["source"] = fname
+            parsed["report_date"] = row[2]
+            dates.append(row[2])
+            rows.append(parsed)
     if not rows:
-        return {"status": "unavailable", "error": "file loaded but no contracts parsed", "note": "CFTC file format changed or parse failed. Positioning is shown as unavailable, no numbers invented.", "rows": []}
-    return {"status": "ok", "note": "Weekly COT, Tuesday positions, released Friday. Net is non-commercial longs minus shorts.", "rows": rows}
+        return {"status": "unavailable",
+                "error": "; ".join(errors)[:200] if errors else "no contracts parsed",
+                "note": "CFTC COT files did not load or no contracts parsed. Positioning is shown as unavailable, no numbers invented.",
+                "rows": []}
+    return {"status": "ok",
+            "report_date": max(dates) if dates else None,
+            "note": f"Weekly COT, Tuesday positions, released Friday. Net is non-commercial longs minus shorts. Report date {max(dates) if dates else 'n/a'}. FX rows are legacy financial futures, commodity rows are the legacy combined file.",
+            "rows": rows}
+
+
+def fetch_treasury(chicago_month):
+    # US Treasury Daily Par Yield Curve Rates, no key. The TextView page is
+    # HTML, not a clean CSV (the yield.csv URL 404s), so parse the table
+    # whose header row contains "10 Yr", map columns by header, and take
+    # the last dated row. Sanity: yields must be between 2 and 8 percent.
+    # This is the only free source found for the 2Y yield, which Yahoo
+    # does not carry, so it unlocks the 2Y/10Y spread.
+    import re
+    url = ("https://home.treasury.gov/resource-center/data-chart-center/"
+           "interest-rates/TextView?type=daily_treasury_yield_curve"
+           f"&field_tdr_date_value_month={chicago_month}")
+    try:
+        raw = fetch_url(url, timeout=30)
+    except Exception as e:
+        return {"status": "unavailable", "error": str(e)[:160]}
+    header = None
+    last = None
+    for m in re.finditer(r"<tr[^>]*>(.*?)</tr>", raw, re.S):
+        cells = [re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", c)).strip()
+                 for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", m.group(1), re.S)]
+        if not cells:
+            continue
+        if "10 Yr" in cells and "2 Yr" in cells:
+            header = cells
+            continue
+        if header and re.match(r"\d{2}/\d{2}/\d{4}", cells[0] or ""):
+            try:
+                vals = {h: float(cells[i]) for i, h in enumerate(header)
+                        if i < len(cells) and h in ("1 Yr", "2 Yr", "3 Yr", "5 Yr", "7 Yr", "10 Yr", "20 Yr", "30 Yr")}
+            except ValueError:
+                continue
+            if "10 Yr" in vals and 2.0 <= vals["10 Yr"] <= 8.0:
+                last = {"date": cells[0], "yields": vals}
+    if not last:
+        return {"status": "unavailable", "error": "no parseable yield row"}
+    return {"status": "ok", "date": last["date"], "yields": last["yields"]}
 
 
 def main():
@@ -276,6 +379,8 @@ def main():
         print(f"fred {s}: {fred[s].get('status')} {fred[s].get('value')}")
     cot = fetch_cot()
     print(f"cot: {cot.get('status')} rows={len(cot.get('rows', []))}")
+    treasury = fetch_treasury(chicago.strftime("%Y%m"))
+    print(f"treasury: {treasury.get('status')} {treasury.get('date')} {treasury.get('yields')}")
     payload = {
         "generated_at_utc": now_utc.isoformat(),
         "generated_at_chicago": chicago.isoformat(),
@@ -284,12 +389,14 @@ def main():
         "ecb": ecb,
         "fred": fred,
         "cot": cot,
+        "treasury": treasury,
         "counts": {"ok": ok, "failed": failed, "total": len(TICKERS)},
         "sources": {
             "yahoo": "Yahoo Finance chart API, no key, range 1y daily. Unofficial and indicative, not execution grade.",
             "ecb": "ECB daily euro reference rates, no key.",
-            "fred": "FRED fredgraph.csv, attempted with 12s timeout. Timed out twice from this VM on Nov 11, 2026, so Yahoo yields are the primary rates source.",
-            "cot": "CFTC Commitments of Traders, free weekly text file.",
+            "fred": "FRED fredgraph.csv, attempted with 12s timeout. Timed out from this VM on Nov 11, 2026 (curl HTTP 000, three variants), so Yahoo yields are the primary rates source. The FRED API needs a free 32-character key.",
+            "cot": "CFTC Commitments of Traders, free weekly text files: FinFutWk.txt for FX, deacom.txt (legacy combined) for commodities. Retried Nov 11: both return HTTP 200; the earlier 403 was transient and the parser bug (startswith on quoted lines) is fixed.",
+            "treasury": "US Treasury Daily Par Yield Curve Rates TextView page, no key. The yield.csv URL 404s, the HTML table parses cleanly and is the only free source found for the 2Y yield.",
         },
     }
     OUT.write_text(json.dumps(payload, indent=2))
